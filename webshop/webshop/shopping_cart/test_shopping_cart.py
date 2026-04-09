@@ -9,15 +9,18 @@ from frappe.tests.utils import change_settings
 from frappe.utils import add_months, cint, nowdate
 
 from erpnext.accounts.doctype.tax_rule.tax_rule import ConflictingTaxRule
+from erpnext.selling.doctype.quotation.quotation import _make_sales_order
 from webshop.webshop.doctype.website_item.website_item import make_website_item
 from webshop.webshop.shopping_cart.cart import (
 	_get_cart_quotation,
 	get_cart_quotation,
 	get_party,
+	place_order,
+	reorder_items,
 	request_for_quotation,
+	update_cart_address,
 	update_cart,
 )
-from erpnext.tests.utils import create_test_contact_and_address
 
 
 class TestShoppingCart(unittest.TestCase):
@@ -230,6 +233,113 @@ class TestShoppingCart(unittest.TestCase):
 
 		self.assertEqual(quote_doctstatus, 1)
 
+	def test_reorder_submitted_sales_order(self):
+		self.setup_customer_two_session()
+
+		billing_address = self.create_customer_address(
+			address_title="_Test Billing Address for Customer 2",
+			address_type="Billing",
+		)
+		shipping_address = self.create_customer_address(
+			address_title="_Test Shipping Address for Customer 2",
+			address_type="Shipping",
+		)
+		sales_order = self.create_submitted_sales_order(
+			items=[
+				{"item_code": "_Test Item", "qty": 2},
+				{"item_code": "_Test Item 2", "qty": 1},
+			],
+			customer_address=billing_address,
+			shipping_address_name=shipping_address,
+		)
+
+		result = reorder_items("Sales Order", sales_order.name)
+		quotation = _get_cart_quotation()
+
+		self.assertEqual(result["route"], "/cart")
+		self.assertEqual([item.item_code for item in quotation.items], ["_Test Item", "_Test Item 2"])
+		self.assertEqual([item.qty for item in quotation.items], [2, 1])
+		self.assertEqual(quotation.customer_address, billing_address)
+		self.assertEqual(quotation.shipping_address_name, shipping_address)
+		self.assertEqual(
+			quotation.items[0].warehouse,
+			frappe.db.get_value("Website Item", {"item_code": "_Test Item"}, "website_warehouse"),
+		)
+
+	def test_reorder_other_customer_order_denied(self):
+		self.setup_customer_two_session()
+		sales_order = self.create_submitted_sales_order(items=[{"item_code": "_Test Item", "qty": 1}])
+
+		self.setup_customer_one_session()
+
+		with self.assertRaises(frappe.PermissionError):
+			reorder_items("Sales Order", sales_order.name)
+
+	def test_reorder_rejects_invalid_sources(self):
+		self.setup_customer_two_session()
+
+		with self.assertRaises(frappe.ValidationError):
+			reorder_items("Quotation", "QTN-INVALID")
+
+		draft_sales_order = self.create_draft_sales_order(items=[{"item_code": "_Test Item", "qty": 1}])
+
+		with self.assertRaises(frappe.ValidationError):
+			reorder_items("Sales Order", draft_sales_order.name)
+
+	def test_reorder_replaces_existing_cart_instead_of_merging(self):
+		self.setup_customer_two_session()
+		sales_order = self.create_submitted_sales_order(items=[{"item_code": "_Test Item 2", "qty": 2}])
+
+		update_cart("_Test Item", 4)
+		reorder_items("Sales Order", sales_order.name)
+		quotation = _get_cart_quotation()
+
+		self.assertEqual(len(quotation.items), 1)
+		self.assertEqual(quotation.items[0].item_code, "_Test Item 2")
+		self.assertEqual(quotation.items[0].qty, 2)
+
+	def test_reorder_uses_current_cart_pricing(self):
+		self.setup_customer_two_session()
+		sales_order = self.create_submitted_sales_order(items=[{"item_code": "_Test Item", "qty": 2}])
+		old_rate = sales_order.items[0].rate
+
+		frappe.db.set_value(
+			"Item Price",
+			{"price_list": "_Test Price List India", "item_code": "_Test Item"},
+			"price_list_rate",
+			25,
+		)
+
+		reorder_items("Sales Order", sales_order.name)
+		quotation = _get_cart_quotation()
+
+		self.assertNotEqual(old_rate, quotation.items[0].rate)
+		self.assertEqual(quotation.items[0].rate, 25)
+		self.assertEqual(quotation.items[0].amount, 50)
+
+	def test_reorder_fails_atomically_for_unavailable_items(self):
+		self.setup_customer_two_session()
+		sales_order = self.create_submitted_sales_order(
+			items=[
+				{"item_code": "_Test Item", "qty": 1},
+				{"item_code": "_Test Item 2", "qty": 2},
+			]
+		)
+
+		update_cart("_Test Item", 4)
+		original_quotation = _get_cart_quotation()
+
+		frappe.db.set_value("Website Item", {"item_code": "_Test Item 2"}, "published", 0)
+
+		with self.assertRaises(frappe.ValidationError):
+			reorder_items("Sales Order", sales_order.name)
+
+		quotation = _get_cart_quotation()
+		self.assertEqual(quotation.name, original_quotation.name)
+		self.assertEqual(len(quotation.items), 1)
+		self.assertEqual(quotation.items[0].item_code, "_Test Item")
+		self.assertEqual(quotation.items[0].qty, 4)
+
 	def create_tax_rule(self):
 		tax_rule = frappe.get_test_records("Tax Rule")[0]
 		try:
@@ -237,7 +347,11 @@ class TestShoppingCart(unittest.TestCase):
 		except (frappe.DuplicateEntryError, ConflictingTaxRule):
 			pass
 
-	def create_quotation(self):
+	def create_quotation(
+		self,
+		items=None,
+		selling_price_list="_Test Price List Rest of the World",
+	):
 		quotation = frappe.new_doc("Quotation")
 
 		values = {
@@ -247,13 +361,13 @@ class TestShoppingCart(unittest.TestCase):
 			"party_name": get_party(frappe.session.user).name,
 			"docstatus": 0,
 			"contact_email": frappe.session.user,
-			"selling_price_list": "_Test Price List Rest of the World",
+			"selling_price_list": selling_price_list,
 			"currency": "USD",
 			"taxes_and_charges": "_Test Tax 1 - _TC",
 			"conversion_rate": 1,
 			"transaction_date": nowdate(),
 			"valid_till": add_months(nowdate(), 1),
-			"items": [{"item_code": "_Test Item", "qty": 1}],
+			"items": items or [{"item_code": "_Test Item", "qty": 1}],
 			"taxes": frappe.get_doc("Sales Taxes and Charges Template", "_Test Tax 1 - _TC").taxes,
 			"company": "_Test Company",
 		}
@@ -267,6 +381,73 @@ class TestShoppingCart(unittest.TestCase):
 	def remove_test_quotation(self, quotation):
 		frappe.set_user("Administrator")
 		quotation.delete()
+
+	def setup_customer_two_session(self):
+		self.login_as_customer(
+			"test_contact_two_customer@example.com", "_Test Contact 2 For _Test Customer"
+		)
+		create_address_and_contact(
+			address_title="_Test Address for Customer 2",
+			first_name="_Test Contact for Customer 2",
+			email="test_contact_two_customer@example.com",
+			customer="_Test Customer 2",
+		)
+		self.clear_existing_quotations()
+
+	def setup_customer_one_session(self):
+		self.login_as_customer()
+		create_address_and_contact(
+			address_title="_Test Address for Customer 1",
+			first_name="_Test Contact For _Test Customer",
+			email="test_contact_customer@example.com",
+			customer="_Test Customer",
+		)
+		self.clear_existing_quotations()
+
+	def create_customer_address(
+		self,
+		address_title,
+		address_type="Office",
+		customer="_Test Customer 2",
+		first_name="_Test Contact for Customer 2",
+		email="test_contact_two_customer@example.com",
+	):
+		create_address_and_contact(
+			address_title=address_title,
+			address_type=address_type,
+			first_name=first_name,
+			email=email,
+			customer=customer,
+		)
+		return frappe.db.get_value("Address", {"address_title": address_title})
+
+	def create_submitted_sales_order(self, items=None, customer_address=None, shipping_address_name=None):
+		self.clear_existing_quotations()
+
+		for item in items or [{"item_code": "_Test Item", "qty": 1}]:
+			update_cart(item["item_code"], item["qty"])
+
+		customer_address = customer_address or frappe.db.get_value(
+			"Address", {"address_title": "_Test Address for Customer 2"}
+		)
+
+		if customer_address:
+			update_cart_address("billing", customer_address)
+
+		if shipping_address_name:
+			update_cart_address("shipping", shipping_address_name)
+
+		return frappe.get_doc("Sales Order", place_order())
+
+	def create_draft_sales_order(self, items=None):
+		quotation = self.create_quotation(items=items)
+		quotation.submit()
+
+		sales_order = frappe.get_doc(_make_sales_order(quotation.name, ignore_permissions=True))
+		sales_order.flags.ignore_permissions = True
+		sales_order.insert()
+
+		return sales_order
 
 	# helper functions
 	def enable_shopping_cart(self):

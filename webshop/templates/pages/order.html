@@ -27,6 +27,11 @@
 						data-action="make_purchase_invoice">{{ _("Make Purchase Invoice") }}
 					</a>
 				{% endif %}
+				{% if show_reorder_action %}
+					<a class="dropdown-item" href="#" id="reorder-items">
+						{{ _("Reorder") }}
+					</a>
+				{% endif %}
 				<a class="dropdown-item"
 					href='/printview?doctype={{ doc.doctype}}&name={{ doc.name }}&format={{ print_format }}' target="_blank"
 					rel="noopener noreferrer">

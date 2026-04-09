@@ -4,9 +4,14 @@
 frappe.ready(() => {
 	var loyalty_points_input = document.getElementById("loyalty-point-to-redeem");
 	var loyalty_points_status = document.getElementById("loyalty-points-status");
+	var reorder_button = document.getElementById("reorder-items");
 
 	if (loyalty_points_input) {
 		loyalty_points_input.onblur = apply_loyalty_points;
+	}
+
+	if (reorder_button) {
+		reorder_button.onclick = reorder_items;
 	}
 
 	function apply_loyalty_points() {
@@ -64,6 +69,24 @@ frappe.ready(() => {
 				"customer": doc_info.customer
 			},
 			callback,
+		});
+	}
+
+	function reorder_items(event) {
+		event.preventDefault();
+
+		frappe.call({
+			btn: reorder_button,
+			type: "POST",
+			method: "webshop.webshop.shopping_cart.cart.reorder_items",
+			args: {
+				source_doctype: doc_info.doctype,
+				source_name: doc_info.doctype_name,
+			},
+			callback: (r) => {
+				if (r.exc) return;
+				window.location.href = (r.message && r.message.route) || "/cart";
+			},
 		});
 	}
 })

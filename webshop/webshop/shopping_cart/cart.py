@@ -153,6 +153,132 @@ def request_for_quotation():
 
 
 @frappe.whitelist()
+def reorder_items(source_doctype, source_name):
+	_require_authenticated_website_user()
+
+	if source_doctype != "Sales Order":
+		frappe.throw(
+			_("Only submitted Sales Orders can be reordered."),
+			title=_("Invalid Order"),
+		)
+
+	source_doc = frappe.get_doc(source_doctype, source_name)
+
+	if not frappe.has_website_permission(source_doc):
+		frappe.throw(_("Not Permitted"), frappe.PermissionError)
+
+	if source_doc.docstatus != 1:
+		frappe.throw(
+			_("Only submitted Sales Orders can be reordered."),
+			title=_("Invalid Order"),
+		)
+
+	unavailable_items = _get_unavailable_reorder_items(source_doc)
+	if unavailable_items:
+		frappe.throw(
+			_("These items are no longer available in the webshop: {0}").format(
+				", ".join(frappe.bold(item) for item in unavailable_items)
+			),
+			title=_("Unavailable Items"),
+		)
+
+	quotation = _get_cart_quotation()
+	quotation.set("items", [])
+
+	for item in source_doc.get("items", []):
+		quotation.append(
+			"items",
+			{
+				"doctype": "Quotation Item",
+				"item_code": item.item_code,
+				"qty": item.qty,
+				"warehouse": _get_reorder_item_warehouse(item.item_code),
+			},
+		)
+
+	_set_reorder_addresses(source_doc, quotation)
+	quotation.shipping_rule = None
+
+	apply_cart_settings(quotation=quotation)
+
+	quotation.flags.ignore_permissions = True
+	quotation.payment_schedule = []
+	quotation.save()
+
+	set_cart_count(quotation)
+
+	return {"route": "/cart"}
+
+
+def _require_authenticated_website_user():
+	if frappe.session.user == "Guest":
+		frappe.throw(_("Please log in to reorder items."), frappe.PermissionError)
+
+	if frappe.db.get_value("User", frappe.session.user, "user_type") != "Website User":
+		frappe.throw(_("Only website users can reorder items."), frappe.PermissionError)
+
+
+def _get_unavailable_reorder_items(source_doc):
+	unavailable_items = []
+
+	for item in source_doc.get("items", []):
+		if not _get_reorder_web_item(item.item_code):
+			unavailable_items.append(_get_reorder_item_label(item))
+
+	return list(dict.fromkeys(unavailable_items))
+
+
+def _get_reorder_item_label(item):
+	item_name = item.get("item_name") or item.item_code
+
+	if item_name != item.item_code:
+		return _("{0} ({1})").format(item_name, item.item_code)
+
+	return item.item_code
+
+
+def _get_reorder_web_item(item_code):
+	web_item = frappe.db.get_value(
+		"Website Item",
+		{"item_code": item_code, "published": 1},
+		["item_code", "website_warehouse"],
+		as_dict=True,
+	)
+
+	if web_item:
+		return web_item
+
+	template_item_code = frappe.get_cached_value("Item", item_code, "variant_of")
+	if template_item_code:
+		return frappe.db.get_value(
+			"Website Item",
+			{"item_code": template_item_code, "published": 1},
+			["item_code", "website_warehouse"],
+			as_dict=True,
+		)
+
+
+def _get_reorder_item_warehouse(item_code):
+	web_item = _get_reorder_web_item(item_code)
+	return web_item.website_warehouse if web_item else None
+
+
+def _set_reorder_addresses(source_doc, quotation):
+	quotation.customer_address = source_doc.customer_address or None
+	quotation.address_display = _get_reorder_address_display(source_doc.customer_address)
+	quotation.shipping_address_name = source_doc.shipping_address_name or None
+	quotation.shipping_address = _get_reorder_address_display(source_doc.shipping_address_name)
+
+
+def _get_reorder_address_display(address_name):
+	if not address_name:
+		return None
+
+	address_doc = frappe.get_doc("Address", address_name).as_dict()
+	return get_address_display(address_doc)
+
+
+@frappe.whitelist()
 def update_cart(item_code, qty, additional_notes=None, with_items=False):
 	quotation = _get_cart_quotation()
 
