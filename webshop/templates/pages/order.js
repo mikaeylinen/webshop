@@ -75,6 +75,18 @@ frappe.ready(() => {
 	function reorder_items(event) {
 		event.preventDefault();
 
+		var cart_count = parseInt(frappe.get_cookie("cart_count")) || 0;
+		if (cart_count > 0) {
+			frappe.confirm(
+				__("Your cart already contains items. Reordering will replace them. Do you want to continue?"),
+				() => do_reorder(),
+			);
+		} else {
+			do_reorder();
+		}
+	}
+
+	function do_reorder() {
 		frappe.call({
 			btn: reorder_button,
 			type: "POST",
