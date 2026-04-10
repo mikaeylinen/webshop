@@ -131,12 +131,32 @@ def place_order():
 
 	sales_order.flags.ignore_permissions = True
 	sales_order.insert()
+	_disable_stock_reservation_for_webshop_order(sales_order)
 	sales_order.submit()
 
 	if hasattr(frappe.local, "cookie_manager"):
 		frappe.local.cookie_manager.delete_cookie("cart_count")
 
 	return sales_order.name
+
+
+def _disable_stock_reservation_for_webshop_order(sales_order):
+	# Internal desk orders may use auto stock reservation, but webshop checkout
+	# should not require portal users to create Stock Reservation Entry docs.
+	changed = False
+
+	if sales_order.get("reserve_stock"):
+		sales_order.reserve_stock = 0
+		changed = True
+
+	for item in sales_order.get("items", []):
+		if item.get("reserve_stock"):
+			item.reserve_stock = 0
+			changed = True
+
+	if changed:
+		sales_order.flags.ignore_permissions = True
+		sales_order.save()
 
 
 @frappe.whitelist()
